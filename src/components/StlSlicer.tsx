@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { StlSlicer as StlSlicerUtil, Axis, LayerData } from '../utils/StlSlicer';
 import { exportSvgZip } from '../utils/exportUtils';
+import { sliceInWorker } from '../utils/slicerWorkerClient';
 import * as THREE from 'three';
 import dynamic from 'next/dynamic';
 import { Sidebar } from './ui/Sidebar';
@@ -31,17 +32,24 @@ export default function StlSlicer() {
   const [error, setError] = useState<string | null>(null);
   const [isClientSide, setIsClientSide] = useState<boolean>(false);
   const [viewMode, setViewMode] = useState<'2d' | '3d'>('3d');
-  const [zoomLevel, setZoomLevel] = useState<number>(0.7); // Initial zoom level reduced to 70% for better visibility
-  const [hasAutoFit, setHasAutoFit] = useState<boolean>(false); // Track if we've auto-fit already
+  const [zoomLevel, setZoomLevel] = useState<number>(0.7);
   
+  const [sliceProgress, setSliceProgress] = useState<number | null>(null);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const slicerRef = useRef<StlSlicerUtil | null>(null);
+  const sliceIdRef = useRef<number>(0); // monotonic counter to discard stale slice results
+  const workerHandleRef = useRef<{ terminate: () => void } | null>(null);
   
   // Check if we're on the client side
   useEffect(() => {
     setIsClientSide(true);
     // Only initialize the slicer on the client side
     slicerRef.current = new StlSlicerUtil();
+
+    return () => {
+      workerHandleRef.current?.terminate();
+    };
   }, []);
   
   // Handle file selection
@@ -70,28 +78,66 @@ export default function StlSlicer() {
     }
   }, [isClientSide]);
   
+  // Shared helper: run slicing in a Web Worker
+  const runSliceWorker = useCallback((sliceAxis: Axis, thickness: number, resetZoom: boolean) => {
+    const slicer = slicerRef.current;
+    if (!slicer) return;
+
+    const geometry = slicer.getGeometry();
+    const boundingBox = slicer.getBoundingBox();
+    if (!geometry || !boundingBox) return;
+
+    // Cancel any in-flight worker
+    workerHandleRef.current?.terminate();
+
+    const currentId = ++sliceIdRef.current;
+    setIsSlicing(true);
+    setSliceProgress(null);
+    setError(null);
+
+    const handle = sliceInWorker(
+      geometry,
+      boundingBox,
+      sliceAxis,
+      thickness,
+      currentId,
+      (percent) => {
+        if (currentId === sliceIdRef.current) {
+          setSliceProgress(Math.round(percent));
+        }
+      }
+    );
+    workerHandleRef.current = handle;
+
+    handle.promise
+      .then((slicedLayers) => {
+        if (currentId === sliceIdRef.current) {
+          setLayers(slicedLayers);
+          setPreviewLayerIndex(Math.floor(slicedLayers.length / 2));
+          if (resetZoom) setZoomLevel(0.7);
+        }
+      })
+      .catch((err) => {
+        if (currentId === sliceIdRef.current) {
+          setError(err instanceof Error ? err.message : 'Failed to slice the model.');
+        }
+      })
+      .finally(() => {
+        if (currentId === sliceIdRef.current) {
+          setIsSlicing(false);
+          setSliceProgress(null);
+        }
+      });
+  }, []);
+
   // Update axis and trigger new slicing when changed
   const handleAxisChange = useCallback((newAxis: Axis) => {
     setAxis(newAxis);
-    setHasAutoFit(false); // Reset auto-fit flag when changing axis
-    
-    // Automatically re-slice when axis changes if we have a loaded file
+
     if (slicerRef.current && file) {
-      setIsSlicing(true);
-      setTimeout(async () => {
-        try {
-          const slicedLayers = slicerRef.current!.sliceModel(newAxis, layerThickness);
-          setLayers(slicedLayers);
-          setPreviewLayerIndex(Math.floor(slicedLayers.length / 2)); // Preview middle layer
-        } catch (err) {
-          setError('Failed to slice the model with the new axis. Please try again.');
-          console.error(err);
-        } finally {
-          setIsSlicing(false);
-        }
-      }, 50);
+      runSliceWorker(newAxis, layerThickness, false);
     }
-  }, [file, layerThickness]);
+  }, [file, layerThickness, runSliceWorker]);
   
   // Handle layer thickness change
   const handleLayerThicknessChange = useCallback((newThickness: number) => {
@@ -116,95 +162,47 @@ export default function StlSlicer() {
   // Function to fit the model to the view
   const handleFitToView = useCallback(() => {
     if (!layers.length || !canvasRef.current || previewLayerIndex >= layers.length) return;
-    
+
     const canvas = canvasRef.current;
     const layer = layers[previewLayerIndex];
-    
-    // Find the bounds of all paths
-    let minX = Number.MAX_VALUE;
-    let maxX = Number.MIN_VALUE;
-    let minY = Number.MAX_VALUE;
-    let maxY = Number.MIN_VALUE;
-    
-    // Check if there are valid paths to calculate bounds
+
     if (layer.paths.length === 0) {
-      setZoomLevel(0.7); // Default if no paths
+      setZoomLevel(0.7);
       return;
     }
-    
-    for (const path of layer.paths) {
-      for (const point of path) {
-        minX = Math.min(minX, point.x);
-        maxX = Math.max(maxX, point.x);
-        minY = Math.min(minY, point.y);
-        maxY = Math.max(maxY, point.y);
-      }
-    }
-    
-    // Check if we have valid bounds
-    if (minX === Number.MAX_VALUE || maxX === Number.MIN_VALUE || 
-        minY === Number.MAX_VALUE || maxY === Number.MIN_VALUE) {
-      setZoomLevel(0.7); // Default if invalid bounds
+
+    const { bounds } = layer;
+    const modelWidth = bounds.maxX - bounds.minX;
+    const modelHeight = bounds.maxY - bounds.minY;
+
+    if (modelWidth <= 0 || modelHeight <= 0) {
+      setZoomLevel(0.7);
       return;
     }
-    
-    // Calculate model dimensions
-    const modelWidth = maxX - minX;
-    const modelHeight = maxY - minY;
-    
-    // Add a margin percentage for better visibility
-    const margin = 0.2; // 20% margin
-    
-    // Calculate the zoom level that would perfectly fit the model
+
+    const margin = 0.2;
     const canvasWidth = canvas.width;
     const canvasHeight = canvas.height;
-    
-    // Calculate zoom factors for both width and height
+
     const zoomX = (canvasWidth / (modelWidth * (1 + margin * 2))) * 0.9;
     const zoomY = (canvasHeight / (modelHeight * (1 + margin * 2))) * 0.9;
-    
-    // Use the smaller zoom to ensure the entire model fits
+
     let optimalZoom = Math.min(zoomX, zoomY);
-    
-    // Limit zoom to reasonable values
     optimalZoom = Math.max(0.2, Math.min(0.9, optimalZoom));
-    
-    // Apply the calculated optimal zoom
+
     setZoomLevel(optimalZoom);
   }, [layers, previewLayerIndex]);
   
   // Perform slicing operation
-  const handleSlice = useCallback(async () => {
+  const handleSlice = useCallback(() => {
     if (!isClientSide) return;
     if (!slicerRef.current || !file) {
       setError('No STL file loaded');
       return;
     }
-    
-    setIsSlicing(true);
-    setError(null);
-    setHasAutoFit(false); // Reset auto-fit flag when slicing
-    
-    try {
-      const slicedLayers = slicerRef.current.sliceModel(axis, layerThickness);
-      setLayers(slicedLayers);
-      setPreviewLayerIndex(Math.floor(slicedLayers.length / 2)); // Preview middle layer
-      
-      // Auto-fit the view when layers are first loaded
-      // Using setTimeout to ensure the layers and canvas are ready
-      setTimeout(() => {
-        if (canvasRef.current && slicedLayers.length > 0) {
-          // Set a reasonable initial zoom instead of calculating it
-          setZoomLevel(0.7);
-        }
-      }, 100);
-    } catch (err) {
-      setError('Failed to slice the model. Please try with different parameters.');
-      console.error(err);
-    } finally {
-      setIsSlicing(false);
-    }
-  }, [axis, layerThickness, file, isClientSide]);
+
+    runSliceWorker(axis, layerThickness, true);
+  }, [axis, layerThickness, file, isClientSide, runSliceWorker]);
   
   // Export sliced layers as SVG files in a ZIP archive
   const handleExport = useCallback(async () => {
@@ -217,7 +215,7 @@ export default function StlSlicer() {
     try {
       const svgContents = layers.map(layer => ({
         layer,
-        svg: slicerRef.current!.generateSVG(layer)
+        svg: slicerRef.current!.generateSVG(layer, axis)
       }));
       
       await exportSvgZip(svgContents, file.name.replace('.stl', ''));
@@ -285,33 +283,18 @@ export default function StlSlicer() {
       const layer = layers[previewLayerIndex];
       
       if (layer.paths.length === 0) {
-        // No paths to render
         ctx.font = '16px sans-serif';
         ctx.fillStyle = 'red';
         ctx.textAlign = 'center';
         ctx.fillText(
-          `No slice data at this layer (${layer.z.toFixed(2)}mm)`, 
+          `No slice data at this layer (${layer.z.toFixed(2)}mm)`,
           canvas.width / 2, canvas.height / 2
         );
         return;
       }
-      
-      // Find bounds
-      let minX = Number.MAX_VALUE;
-      let maxX = Number.MIN_VALUE;
-      let minY = Number.MAX_VALUE;
-      let maxY = Number.MIN_VALUE;
-      
-      for (const path of layer.paths) {
-        for (const point of path) {
-          minX = Math.min(minX, point.x);
-          maxX = Math.max(maxX, point.x);
-          minY = Math.min(minY, point.y);
-          maxY = Math.max(maxY, point.y);
-        }
-      }
-      
-      // Calculate model dimensions
+
+      // Use cached bounds from layer
+      const { minX, maxX, minY, maxY } = layer.bounds;
       const modelWidth = maxX - minX;
       const modelHeight = maxY - minY;
       
@@ -341,17 +324,6 @@ export default function StlSlicer() {
       // Apply user zoom
       const scale = baseScale * zoomLevel;
       
-      // Draw coordinate system for debugging
-      ctx.save();
-      ctx.strokeStyle = '#ccc';
-      ctx.beginPath();
-      ctx.moveTo(0, canvas.height / 2);
-      ctx.lineTo(canvas.width, canvas.height / 2);
-      ctx.moveTo(canvas.width / 2, 0);
-      ctx.lineTo(canvas.width / 2, canvas.height);
-      ctx.stroke();
-      ctx.restore();
-      
       // Translate to center of canvas
       ctx.save();
       ctx.translate(canvas.width / 2, canvas.height / 2);
@@ -363,11 +335,6 @@ export default function StlSlicer() {
       
       // Translate to center the model
       ctx.translate(-modelCenterX, -modelCenterY);
-      
-      // Draw colored border around model bounds for debugging
-      ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
-      ctx.lineWidth = 2 / scale;
-      ctx.strokeRect(minX, minY, modelWidth, modelHeight);
       
       // Draw all paths
       ctx.strokeStyle = 'black';
@@ -392,23 +359,13 @@ export default function StlSlicer() {
       // Restore context to draw text without transforms
       ctx.restore();
       
-      // Draw text overlay
+      // Draw layer info text
       ctx.font = '12px sans-serif';
       ctx.fillStyle = 'black';
       ctx.textAlign = 'left';
       ctx.fillText(
-        `Layer ${previewLayerIndex + 1}/${layers.length} - Height: ${layer.z.toFixed(2)}mm (${layer.paths.length} paths)`, 
+        `Layer ${previewLayerIndex + 1}/${layers.length} - Height: ${layer.z.toFixed(2)}mm (${layer.paths.length} paths)`,
         10, 20
-      );
-      
-      ctx.fillText(
-        `Zoom: ${Math.round(zoomLevel * 100)}% (Scale: ${baseScale.toFixed(3)})`, 
-        10, 40
-      );
-      
-      ctx.fillText(
-        `Model: ${modelWidth.toFixed(1)} x ${modelHeight.toFixed(1)} | Canvas: ${canvas.width} x ${canvas.height}`, 
-        10, 60
       );
     }
   }, [layers, previewLayerIndex, isClientSide, zoomLevel]);
@@ -429,6 +386,8 @@ export default function StlSlicer() {
         axis={axis}
         layerThickness={layerThickness}
         isSlicing={isSlicing}
+        sliceProgress={sliceProgress}
+        hasLayers={layers.length > 0}
         onFileChange={handleFileChange}
         onAxisChange={handleAxisChange}
         onLayerThicknessChange={handleLayerThicknessChange}

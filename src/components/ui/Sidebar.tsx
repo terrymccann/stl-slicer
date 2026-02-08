@@ -12,6 +12,8 @@ interface SidebarProps {
   axis: Axis;
   layerThickness: number;
   isSlicing: boolean;
+  sliceProgress?: number | null;
+  hasLayers: boolean;
   onFileChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   onAxisChange: (axis: Axis) => void;
   onLayerThicknessChange: (thickness: number) => void;
@@ -27,6 +29,8 @@ export function Sidebar({
   axis,
   layerThickness,
   isSlicing,
+  sliceProgress,
+  hasLayers,
   onFileChange,
   onAxisChange,
   onLayerThicknessChange,
@@ -133,12 +137,16 @@ export function Sidebar({
               className="w-full"
               variant="default"
             >
-              {isSlicing ? 'Slicing...' : 'Slice Model'}
+              {isSlicing
+                ? sliceProgress != null
+                  ? `Slicing... ${sliceProgress}%`
+                  : 'Slicing...'
+                : 'Slice Model'}
             </Button>
             
             <Button
               onClick={onExport}
-              disabled={!file}
+              disabled={!file || !hasLayers}
               className="w-full"
               variant="outline"
             >

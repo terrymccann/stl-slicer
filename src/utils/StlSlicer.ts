@@ -1,17 +1,52 @@
 import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import { BVHSlicer } from './BVHSlicer';
 
 export type Axis = 'x' | 'y' | 'z';
+export type PathBounds = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+};
 export type LayerData = {
   index: number;
   paths: Array<Array<THREE.Vector2>>;
   z: number;
+  bounds: PathBounds;
 };
+
+/**
+ * Compute the 2D bounding box of a set of paths.
+ */
+export function computePathBounds(paths: Array<Array<THREE.Vector2>>): PathBounds {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+
+  for (const path of paths) {
+    for (const point of path) {
+      if (point.x < minX) minX = point.x;
+      if (point.x > maxX) maxX = point.x;
+      if (point.y < minY) minY = point.y;
+      if (point.y > maxY) maxY = point.y;
+    }
+  }
+
+  // If no points were found, return zero bounds
+  if (minX === Infinity) {
+    return { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+  }
+
+  return { minX, maxX, minY, maxY };
+}
 
 export class StlSlicer {
   private geometry: THREE.BufferGeometry | null = null;
   private mesh: THREE.Mesh | null = null;
   private boundingBox: THREE.Box3 | null = null;
+  private bvhSlicer: BVHSlicer | null = null;
 
   constructor() {}
 
@@ -48,7 +83,10 @@ export class StlSlicer {
             }
             
             this.geometry = geometry;
-            
+
+            // Build BVH for accelerated slicing (constructed once per model load)
+            this.bvhSlicer = new BVHSlicer(geometry);
+
             // Create a mesh from the geometry
             const material = new THREE.MeshBasicMaterial({ color: 0xffffff });
             this.mesh = new THREE.Mesh(geometry, material);
@@ -60,17 +98,23 @@ export class StlSlicer {
             resolve();
           }
         } catch (error) {
-          console.error('Error loading STL:', error);
           reject(error);
         }
       };
 
       reader.onerror = (error) => {
-        console.error('FileReader error:', error);
         reject(error);
       };
       reader.readAsArrayBuffer(file);
     });
+  }
+
+  getGeometry(): THREE.BufferGeometry | null {
+    return this.geometry;
+  }
+
+  getBoundingBox(): THREE.Box3 | null {
+    return this.boundingBox;
   }
 
   /**
@@ -90,9 +134,31 @@ export class StlSlicer {
   }
 
   /**
+   * Load geometry from raw typed arrays (used by Web Worker).
+   */
+  loadFromBuffers(
+    positionArray: Float32Array,
+    indexArray: Uint32Array,
+    boundingBoxMin: [number, number, number],
+    boundingBoxMax: [number, number, number]
+  ): void {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positionArray, 3));
+    geometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
+    geometry.computeVertexNormals();
+
+    this.geometry = geometry;
+    this.boundingBox = new THREE.Box3(
+      new THREE.Vector3(...boundingBoxMin),
+      new THREE.Vector3(...boundingBoxMax)
+    );
+    this.bvhSlicer = new BVHSlicer(geometry);
+  }
+
+  /**
    * Slice the STL model along the specified axis with the given layer thickness
    */
-  sliceModel(axis: Axis, layerThickness: number): LayerData[] {
+  sliceModel(axis: Axis, layerThickness: number, onProgress?: (percent: number) => void): LayerData[] {
     if (!this.geometry || !this.boundingBox) {
       throw new Error('No model loaded');
     }
@@ -107,7 +173,6 @@ export class StlSlicer {
 
     // If no indices, we need to create them (although we should have done this in loadSTL)
     if (!indices) {
-      console.warn('No indices found on geometry, creating them automatically');
       const newIndices = [];
       for (let i = 0; i < position.count; i++) {
         newIndices.push(i);
@@ -160,157 +225,78 @@ export class StlSlicer {
     for (let i = 0; i < calculatedLayerCount; i++) {
       const z = start + (i * adjustedLayerThickness);
       const paths = this.createSlice(z, axis);
-      
+
       layers.push({
         index: i,
         paths,
-        z
+        z,
+        bounds: computePathBounds(paths)
       });
+
+      if (onProgress) {
+        onProgress(((i + 1) / calculatedLayerCount) * 100);
+      }
     }
-    
+
     return layers;
   }
 
   /**
-   * Create a slice at the specified position along the given axis
+   * Create a slice at the specified position along the given axis.
+   * Uses BVH shapecast for accelerated triangle-plane intersection.
    */
   private createSlice(position: number, axis: Axis): Array<Array<THREE.Vector2>> {
-    if (!this.geometry) {
+    if (!this.geometry || !this.bvhSlicer) {
       throw new Error('No model loaded');
     }
 
-    const posAttr = this.geometry.getAttribute('position');
-    let indices = this.geometry.getIndex();
-    
-    if (!posAttr) {
-      throw new Error('Invalid geometry: missing position attribute');
-    }
+    // BVH shapecast finds only triangles that intersect the slice plane
+    const intersectedEdges = this.bvhSlicer.sliceAtPlane(position, axis);
 
-    // If no indices, create them (although this should have been handled already)
-    if (!indices) {
-      console.warn('No indices found in createSlice, creating them automatically');
-      const newIndices = [];
-      for (let i = 0; i < posAttr.count; i += 3) {
-        newIndices.push(i, i + 1, i + 2);
-      }
-      this.geometry.setIndex(newIndices);
-      indices = this.geometry.getIndex();
-      
-      if (!indices) {
-        throw new Error('Failed to create indices in createSlice');
-      }
-    }
-
-    const intersectedEdges: Array<Array<THREE.Vector3>> = [];
-
-    // Ensure we're dealing with triangles
-    if (indices.count % 3 !== 0) {
-      console.warn('Geometry is not made up of triangles');
-    }
-
-    // Check each triangle for intersection with the slice plane
-    for (let i = 0; i < indices.count; i += 3) {
-      try {
-        const idx1 = indices.getX(i);
-        const idx2 = indices.getX(i + 1);
-        const idx3 = indices.getX(i + 2);
-
-        const v1 = new THREE.Vector3(
-          posAttr.getX(idx1),
-          posAttr.getY(idx1),
-          posAttr.getZ(idx1)
-        );
-        
-        const v2 = new THREE.Vector3(
-          posAttr.getX(idx2),
-          posAttr.getY(idx2),
-          posAttr.getZ(idx2)
-        );
-        
-        const v3 = new THREE.Vector3(
-          posAttr.getX(idx3),
-          posAttr.getY(idx3),
-          posAttr.getZ(idx3)
-        );
-
-        // Check if the triangle intersects with the slice plane
-        const intersectionPoints: THREE.Vector3[] = [];
-
-        // Helper function to check if an edge intersects with the slice plane
-        const checkEdge = (start: THREE.Vector3, end: THREE.Vector3) => {
-          let a, b;
-          if (axis === 'x') {
-            a = start.x;
-            b = end.x;
-          } else if (axis === 'y') {
-            a = start.y;
-            b = end.y;
-          } else {
-            a = start.z;
-            b = end.z;
-          }
-
-          // Check if the edge crosses the slice plane
-          if ((a <= position && b >= position) || (a >= position && b <= position)) {
-            const t = Math.abs((position - a) / (b - a));
-            if (!isNaN(t) && isFinite(t)) {
-              const point = new THREE.Vector3().lerpVectors(start, end, t);
-              intersectionPoints.push(point);
-            }
-          }
-        };
-
-        // Check each edge of the triangle
-        checkEdge(v1, v2);
-        checkEdge(v2, v3);
-        checkEdge(v3, v1);
-
-        // If we have exactly 2 intersection points, we have a valid line segment
-        if (intersectionPoints.length === 2) {
-          intersectedEdges.push(intersectionPoints);
-        }
-      } catch (error) {
-        console.error('Error processing triangle:', error);
-      }
-    }
+    // Compute bounding box diagonal for scale-aware tolerances
+    const bbSize = new THREE.Vector3();
+    this.boundingBox!.getSize(bbSize);
+    const diagonal = bbSize.length();
 
     // Convert intersected edges into 2D paths
-    return this.buildPaths(intersectedEdges, axis);
+    return this.buildPaths(intersectedEdges, axis, diagonal);
   }
 
   /**
    * Convert 3D intersection points to 2D paths
    */
-  private buildPaths(edges: Array<Array<THREE.Vector3>>, axis: Axis): Array<Array<THREE.Vector2>> {
+  private buildPaths(edges: Array<Array<THREE.Vector3>>, axis: Axis, diagonal: number): Array<Array<THREE.Vector2>> {
     if (edges.length === 0) {
-      console.warn('No edges found for this slice');
       return [];
     }
-    
-    console.log(`[StlSlicer] Building paths from ${edges.length} edges`);
+
+    // Scale-aware tolerances derived from bounding box diagonal
+    const safeDiag = Math.max(diagonal, 1e-10); // guard against degenerate models
+    const TOLERANCE = safeDiag * 1e-5;           // point deduplication
+    const ZERO_LENGTH_TOL = safeDiag * 1e-6;     // zero-length segment filter
+    const MIN_PATH_LENGTH = safeDiag * 1e-3;     // minimum path perimeter
+    const FALLBACK_RADIUS = safeDiag * 1e-4;     // fallback neighbor search radius
 
     // Convert 3D points to 2D based on the slicing axis
     const segments: Array<[THREE.Vector2, THREE.Vector2]> = [];
-    
+
     // Process each edge and convert to 2D segment
     for (const edge of edges) {
       // Ensure the edge has exactly two points
       if (edge.length !== 2 || !edge[0] || !edge[1]) {
-        console.warn('Skipping invalid edge:', edge);
         continue;
       }
-      
+
       const p1 = this.convertTo2D(edge[0], axis);
       const p2 = this.convertTo2D(edge[1], axis);
-      
+
       // Avoid zero-length segments
-      if (p1.distanceTo(p2) > 0.0001) {
+      if (p1.distanceTo(p2) > ZERO_LENGTH_TOL) {
         segments.push([p1, p2]);
       }
     }
 
     if (segments.length === 0) {
-      console.warn('No valid 2D segments generated');
       return [];
     }
 
@@ -323,8 +309,7 @@ export class StlSlicer {
 
     const nodes: Node[] = [];
     const nodeMap = new Map<string, number>(); // Map point hash to index in nodes array
-    const TOLERANCE = 0.01;
-    
+
     // Function to get a unique key for a point (for detecting duplicates)
     const getPointKey = (point: THREE.Vector2) => {
       return `${Math.round(point.x / TOLERANCE)},${Math.round(point.y / TOLERANCE)}`;
@@ -358,197 +343,215 @@ export class StlSlicer {
       }
     }
     
-    console.log(`[StlSlicer] Built graph with ${nodes.length} nodes`);
-    
     const paths: Array<Array<THREE.Vector2>> = [];
-    
-    // Specialized algorithm for detecting closed contours first
-    const findClosedContours = () => {
-      // First pass - try to find clean closed loops without any branches
-      for (let startIdx = 0; startIdx < nodes.length; startIdx++) {
+
+    // Choose the best next node from a junction. At degree-3+ nodes, pick the
+    // connection that continues most "straight" (smallest turning angle).
+    const chooseBestConnection = (prevIdx: number | null, currentIdx: number, exclude: Set<number>): number | null => {
+      const current = nodes[currentIdx];
+      const candidates: number[] = [];
+      for (const connIdx of current.connections) {
+        if (exclude.has(connIdx)) continue;
+        candidates.push(connIdx);
+      }
+      if (candidates.length === 0) return null;
+      if (candidates.length === 1) return candidates[0];
+
+      // If we have no previous direction, just pick the first candidate
+      if (prevIdx === null) return candidates[0];
+
+      // Direction we arrived from
+      const prev = nodes[prevIdx].position;
+      const cur = current.position;
+      const inAngle = Math.atan2(cur.y - prev.y, cur.x - prev.x);
+
+      let bestIdx: number | null = null;
+      let bestAngleDiff = Infinity;
+
+      for (const candIdx of candidates) {
+        const cand = nodes[candIdx].position;
+        const outAngle = Math.atan2(cand.y - cur.y, cand.x - cur.x);
+        // Smallest absolute turn = most straight continuation
+        let diff = Math.abs(outAngle - inAngle);
+        if (diff > Math.PI) diff = 2 * Math.PI - diff;
+        if (diff < bestAngleDiff) {
+          bestAngleDiff = diff;
+          bestIdx = candIdx;
+        }
+      }
+      return bestIdx;
+    };
+
+    // First pass: trace contours starting from degree-1 (open endpoints) and
+    // degree-2 (loop) nodes. Degree-3+ junctions are traversed using the
+    // turning-angle heuristic but not used as starting points in this pass.
+    const findContours = () => {
+      // Prefer starting from degree-1 nodes first (natural open-path endpoints),
+      // then degree-2 nodes (clean loops).
+      const startOrder = [...Array(nodes.length).keys()].sort((a, b) => {
+        const da = nodes[a].connections.size;
+        const db = nodes[b].connections.size;
+        // degree-1 first, then degree-2, then the rest
+        if (da === 1 && db !== 1) return -1;
+        if (db === 1 && da !== 1) return 1;
+        if (da === 2 && db !== 2) return -1;
+        if (db === 2 && da !== 2) return 1;
+        return a - b;
+      });
+
+      for (const startIdx of startOrder) {
         if (nodes[startIdx].used) continue;
-        
-        // Only consider nodes with exactly 2 connections as starting points
-        // These are ideal for loops/circles
-        if (nodes[startIdx].connections.size !== 2) continue;
-        
+        // Skip degree-3+ as starting points — they'll be traversed through
+        if (nodes[startIdx].connections.size > 2) continue;
+
         const path: Array<THREE.Vector2> = [nodes[startIdx].position.clone()];
+        const pathNodeIndices: number[] = [startIdx];
         nodes[startIdx].used = true;
-        
+
         let currentIdx = startIdx;
+        let prevIdx: number | null = null;
         let complete = false;
         let length = 0;
-        
-        // Keep following the path until we return to start or hit a dead-end
+
         while (!complete) {
-          const currentNode = nodes[currentIdx];
-          let nextIdx: number | null = null;
-          
-          // Find an unused connection
-          for (const connIdx of currentNode.connections) {
-            if (!nodes[connIdx].used) {
-              nextIdx = connIdx;
-              break;
-            }
-          }
-          
-          // If no next node or we've visited all neighbors, check if path forms a loop
+          const usedSet = new Set<number>(pathNodeIndices);
+          // At the start node, don't exclude it (so we can detect closure)
+          usedSet.delete(startIdx);
+
+          const nextIdx = chooseBestConnection(prevIdx, currentIdx, usedSet);
+
           if (nextIdx === null) {
-            // Check if we can close the loop - are we connected to the start?
-            for (const connIdx of currentNode.connections) {
-              if (connIdx === startIdx) {
-                complete = true;
-                break;
-              }
-            }
-            break; // Exit the while loop, we're done with this path
+            break;
           }
-          
-          // Add the next point to the path and mark it as used
+
+          // Check if we've returned to the start (closed loop)
+          if (nextIdx === startIdx) {
+            complete = true;
+            // Add closing segment length
+            length += nodes[currentIdx].position.distanceTo(nodes[startIdx].position);
+            break;
+          }
+
+          prevIdx = currentIdx;
           currentIdx = nextIdx;
           path.push(nodes[currentIdx].position.clone());
+          pathNodeIndices.push(currentIdx);
           nodes[currentIdx].used = true;
-          
-          // Calculate length so far
+
           if (path.length > 1) {
             length += path[path.length - 1].distanceTo(path[path.length - 2]);
           }
-          
-          // If we found our way back to the start, we have a closed loop
-          if (currentIdx === startIdx) {
-            complete = true;
-          }
-          
-          // Safety check - don't let paths get too long
+
+          // Safety check
           if (path.length > segments.length * 2) {
-            console.warn('Path is too long, breaking loop');
             break;
           }
         }
-        
-        // If we completed a loop and it's not too small, add it to paths
-        if (complete && path.length >= 3 && length > 0.5) {
-          // Ensure the path is closed
-          if (path[0].distanceTo(path[path.length - 1]) > TOLERANCE) {
-            path.push(path[0].clone());
+
+        if (path.length >= 3 && length > MIN_PATH_LENGTH) {
+          if (complete) {
+            // Closed loop — ensure geometric closure
+            if (path[0].distanceTo(path[path.length - 1]) > TOLERANCE) {
+              path.push(path[0].clone());
+            }
           }
+          // Open paths (degree-1 start) are kept open — no force-close
           paths.push(path);
         } else {
-          // If we didn't complete a loop, unmark these nodes so they can be used in other paths
-          for (let i = 0; i < path.length; i++) {
-            const nodeIdx = nodeMap.get(getPointKey(path[i]));
-            if (nodeIdx !== undefined) {
-              nodes[nodeIdx].used = false;
-            }
+          // Not viable — unmark so nodes can be reused
+          for (const idx of pathNodeIndices) {
+            nodes[idx].used = false;
           }
         }
       }
     };
+
+    findContours();
     
-    // Run the specialized contour detection
-    findClosedContours();
-    
-    // Second pass - handle any remaining segments
+    // Second pass — handle any remaining unused nodes using separate visited
+    // sets for forward and backward extension so they don't block each other.
     const handleRemainingSegments = () => {
       const remaining = nodes.filter(node => !node.used);
       if (remaining.length === 0) return;
-      
-      console.log(`[StlSlicer] Processing ${remaining.length} remaining nodes`);
-      
-      // Helper function to find the best next node
+
+      // Find the best unused connected node, preferring fewer connections
       const findBestNextNode = (currentIdx: number, visited: Set<number>): number | null => {
         const currentNode = nodes[currentIdx];
         let bestNextIdx: number | null = null;
         let bestScore = Infinity;
-        
+
         for (const nextIdx of currentNode.connections) {
           if (visited.has(nextIdx)) continue;
           if (nodes[nextIdx].used) continue;
-          
-          // Score based on number of connections (fewer is better)
+
           const score = nodes[nextIdx].connections.size;
           if (score < bestScore) {
             bestScore = score;
             bestNextIdx = nextIdx;
           }
         }
-        
+
         return bestNextIdx;
       };
-      
-      // Process remaining nodes
+
       for (let i = 0; i < nodes.length; i++) {
         if (nodes[i].used) continue;
-        
-        const path: Array<THREE.Vector2> = [nodes[i].position.clone()];
-        nodes[i].used = true;
-        
-        const visited = new Set<number>([i]);
-        let currentIdx = i;
+
+        // Forward extension — its own visited set
+        const forwardVisited = new Set<number>([i]);
+        const forwardPath: Array<THREE.Vector2> = [nodes[i].position.clone()];
+        let fwdIdx = i;
         let length = 0;
-        
-        // Extend the path in both directions
-        
-        // Forward direction
+
         while (true) {
-          const nextIdx = findBestNextNode(currentIdx, visited);
+          const nextIdx = findBestNextNode(fwdIdx, forwardVisited);
           if (nextIdx === null) break;
-          
-          path.push(nodes[nextIdx].position.clone());
-          nodes[nextIdx].used = true;
-          visited.add(nextIdx);
-          
-          // Calculate length
-          length += path[path.length - 1].distanceTo(path[path.length - 2]);
-          
-          currentIdx = nextIdx;
+
+          forwardPath.push(nodes[nextIdx].position.clone());
+          forwardVisited.add(nextIdx);
+          length += nodes[nextIdx].position.distanceTo(nodes[fwdIdx].position);
+          fwdIdx = nextIdx;
         }
-        
-        // Backward direction (start from the original node again)
-        currentIdx = i;
+
+        // Backward extension — its own visited set (only shares the start node)
+        const backwardVisited = new Set<number>([i]);
         const reversePath: Array<THREE.Vector2> = [];
-        
+        let bwdIdx = i;
+
         while (true) {
-          const nextIdx = findBestNextNode(currentIdx, visited);
+          const nextIdx = findBestNextNode(bwdIdx, backwardVisited);
           if (nextIdx === null) break;
-          
+
           reversePath.unshift(nodes[nextIdx].position.clone());
-          nodes[nextIdx].used = true;
-          visited.add(nextIdx);
-          
-          // Calculate length
-          if (reversePath.length > 0) {
-            length += nodes[nextIdx].position.distanceTo(
-              reversePath.length > 0 ? reversePath[0] : nodes[currentIdx].position
-            );
-          }
-          
-          currentIdx = nextIdx;
+          backwardVisited.add(nextIdx);
+          length += nodes[nextIdx].position.distanceTo(nodes[bwdIdx].position);
+          bwdIdx = nextIdx;
         }
-        
-        // Combine paths: reversePath + original point + forward path
-        const fullPath = [...reversePath, ...path];
-        
-        // Only add paths with reasonable size and length
-        if (fullPath.length >= 3 && length > 0.5) {
-          // Check if it's a closed path
+
+        // Combine: reversePath + forwardPath
+        const fullPath = [...reversePath, ...forwardPath];
+
+        if (fullPath.length >= 3 && length > MIN_PATH_LENGTH) {
+          // Mark all visited nodes as used
+          for (const idx of forwardVisited) nodes[idx].used = true;
+          for (const idx of backwardVisited) nodes[idx].used = true;
+
           const first = fullPath[0];
           const last = fullPath[fullPath.length - 1];
-          
+
           if (first.distanceTo(last) < TOLERANCE) {
             // Already closed
             paths.push(fullPath);
           } else {
-            // Check if we can close this path
+            // Check if endpoints are connected in the graph → closeable contour
             const startNodeIdx = nodeMap.get(getPointKey(first));
             const endNodeIdx = nodeMap.get(getPointKey(last));
-            
+
             if (startNodeIdx !== undefined && endNodeIdx !== undefined &&
                 nodes[startNodeIdx].connections.has(endNodeIdx)) {
-              // Can be closed - it's a contour
               paths.push([...fullPath, first.clone()]);
             } else {
-              // Can't be closed properly - but still add as an open path if it's long enough
+              // Open path — keep as-is, don't force-close
               paths.push(fullPath);
             }
           }
@@ -559,85 +562,99 @@ export class StlSlicer {
     // Process any remaining segments
     handleRemainingSegments();
     
-    // If we didn't find any paths, try again with a simpler method
+    // If we didn't find any paths, try a segment-aware fallback that preserves
+    // original segment pairing and keeps disconnected components separate.
     if (paths.length === 0) {
-      console.warn('[StlSlicer] Failed to find paths with advanced algorithm, trying fallback method');
-      
-      // Simple method: connect nearest segments
-      const allPoints: THREE.Vector2[] = [];
-      const usedIndices = new Set<number>();
-      
-      // Extract all points from segments
-      for (const [p1, p2] of segments) {
-        allPoints.push(p1.clone(), p2.clone());
-      }
-      
-      // Try to find paths by connecting closest points
-      while (usedIndices.size < allPoints.length) {
-        let startIdx = -1;
-        for (let i = 0; i < allPoints.length; i++) {
-          if (!usedIndices.has(i)) {
-            startIdx = i;
-            break;
-          }
-        }
-        
-        if (startIdx === -1) break;
-        
-        const path: THREE.Vector2[] = [allPoints[startIdx].clone()];
-        usedIndices.add(startIdx);
-        
-        let currentPoint = allPoints[startIdx];
-        while (true) {
-          let closestIdx = -1;
-          let closestDist = Infinity;
-          
-          // Find closest unused point
-          for (let i = 0; i < allPoints.length; i++) {
-            if (usedIndices.has(i)) continue;
-            
-            const dist = currentPoint.distanceTo(allPoints[i]);
-            if (dist < closestDist && dist < TOLERANCE * 10) {
-              closestDist = dist;
-              closestIdx = i;
+
+      const usedSegments = new Set<number>();
+
+      // Find the closest unused segment endpoint to a given point
+      const findClosestSegment = (point: THREE.Vector2, excludeSet: Set<number>): { segIdx: number; endIdx: 0 | 1 } | null => {
+        let bestSegIdx = -1;
+        let bestEndIdx: 0 | 1 = 0;
+        let bestDist = FALLBACK_RADIUS;
+
+        for (let i = 0; i < segments.length; i++) {
+          if (excludeSet.has(i)) continue;
+          for (const endIdx of [0, 1] as const) {
+            const dist = point.distanceTo(segments[i][endIdx]);
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestSegIdx = i;
+              bestEndIdx = endIdx;
             }
           }
-          
-          // No more close points found
-          if (closestIdx === -1) break;
-          
-          path.push(allPoints[closestIdx].clone());
-          usedIndices.add(closestIdx);
-          currentPoint = allPoints[closestIdx];
-          
-          // Check if path is getting too long
-          if (path.length > allPoints.length) {
-            console.warn('Fallback path is too long, breaking');
-            break;
+        }
+
+        return bestSegIdx === -1 ? null : { segIdx: bestSegIdx, endIdx: bestEndIdx };
+      };
+
+      // Chain segments into paths, keeping disconnected components separate
+      for (let i = 0; i < segments.length; i++) {
+        if (usedSegments.has(i)) continue;
+
+        // Start a new path with this segment
+        const path: THREE.Vector2[] = [segments[i][0].clone(), segments[i][1].clone()];
+        usedSegments.add(i);
+
+        // Extend forward from the last point
+        let extended = true;
+        while (extended) {
+          extended = false;
+          const tail = path[path.length - 1];
+          const match = findClosestSegment(tail, usedSegments);
+          if (match) {
+            usedSegments.add(match.segIdx);
+            const seg = segments[match.segIdx];
+            // endIdx is the matched end — walk the segment from matched end to the other end
+            if (match.endIdx === 0) {
+              path.push(seg[1].clone());
+            } else {
+              path.push(seg[0].clone());
+            }
+            extended = true;
           }
         }
-        
-        // Only add paths with at least 3 points
+
+        // Extend backward from the first point
+        extended = true;
+        while (extended) {
+          extended = false;
+          const head = path[0];
+          const match = findClosestSegment(head, usedSegments);
+          if (match) {
+            usedSegments.add(match.segIdx);
+            const seg = segments[match.segIdx];
+            if (match.endIdx === 0) {
+              path.unshift(seg[1].clone());
+            } else {
+              path.unshift(seg[0].clone());
+            }
+            extended = true;
+          }
+        }
+
         if (path.length >= 3) {
           paths.push(path);
         }
       }
     }
     
-    console.log(`[StlSlicer] Built ${paths.length} paths`);
-    
-    // Final cleanup - make sure all paths are properly closed
+    // Final cleanup — only ensure geometrically-near-closed paths are fully
+    // closed. Open paths from non-manifold geometry are preserved as open.
     return paths.map(path => {
       if (path.length < 3) return path;
-      
+
       const first = path[0];
       const last = path[path.length - 1];
-      
-      // If the path is not already closed, force-close it
-      if (first.distanceTo(last) > TOLERANCE) {
+      const gap = first.distanceTo(last);
+
+      // If the endpoints are very close (within tolerance) but not identical,
+      // snap them shut. Otherwise leave the path as-is.
+      if (gap > 0 && gap <= TOLERANCE) {
         return [...path, first.clone()];
       }
-      
+
       return path;
     });
   }
@@ -647,7 +664,6 @@ export class StlSlicer {
    */
   private convertTo2D(point: THREE.Vector3, axis: Axis): THREE.Vector2 {
     if (!point || typeof point.x !== 'number' || typeof point.y !== 'number' || typeof point.z !== 'number') {
-      console.warn('Invalid point for 2D conversion:', point);
       return new THREE.Vector2(0, 0);
     }
     
@@ -663,46 +679,47 @@ export class StlSlicer {
   /**
    * Generate an SVG string from layer data
    */
-  generateSVG(layer: LayerData): string {
+  generateSVG(layer: LayerData, _axis: Axis = 'z'): string {
     if (!this.boundingBox) {
       throw new Error('No model loaded');
     }
 
-    const size = new THREE.Vector3();
-    this.boundingBox.getSize(size);
+    const { bounds } = layer;
+    const boundsWidth = bounds.maxX - bounds.minX;
+    const boundsHeight = bounds.maxY - bounds.minY;
 
-    const width = Math.ceil(Math.max(size.x, size.y));
-    const height = Math.ceil(Math.max(size.x, size.y));
+    // Use cached 2D bounds for width/height; fall back to small defaults for empty layers
+    const padding = 1; // 1mm padding around geometry
+    const width = boundsWidth > 0 ? boundsWidth + padding * 2 : 10;
+    const height = boundsHeight > 0 ? boundsHeight + padding * 2 : 10;
 
     // Check if we have any valid paths
     if (layer.paths.length === 0) {
-      console.warn(`[StlSlicer] No paths for layer ${layer.index} at z=${layer.z}`);
-      // Return an empty SVG with a message
       return `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<svg width="${width}mm" height="${height}mm" viewBox="0 0 ${width} ${height}" 
+<svg width="${width.toFixed(3)}mm" height="${height.toFixed(3)}mm" viewBox="0 0 ${width.toFixed(3)} ${height.toFixed(3)}"
      xmlns="http://www.w3.org/2000/svg">
-<g transform="translate(${width/2}, ${height/2})">
-  <text x="0" y="0" text-anchor="middle" font-size="3" fill="red">
+  <text x="${(width / 2).toFixed(3)}" y="${(height / 2).toFixed(3)}" text-anchor="middle" font-size="3" fill="red">
     No slice data at this layer (${layer.z.toFixed(2)}mm)
   </text>
-</g>
 </svg>`;
     }
 
-    // SVG header
-    let svg = `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<svg width="${width}mm" height="${height}mm" viewBox="0 0 ${width} ${height}" 
-     xmlns="http://www.w3.org/2000/svg">
-<g transform="translate(${width/2}, ${height/2})">`;
+    // viewBox origin at bounds min minus padding, so geometry is correctly framed
+    const viewBoxX = bounds.minX - padding;
+    const viewBoxY = bounds.minY - padding;
 
-    // Add each path as a polyline
+    // SVG header — viewBox frames the actual geometry with padding
+    let svg = `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="${width.toFixed(3)}mm" height="${height.toFixed(3)}mm" viewBox="${viewBoxX.toFixed(3)} ${viewBoxY.toFixed(3)} ${width.toFixed(3)} ${height.toFixed(3)}"
+     xmlns="http://www.w3.org/2000/svg">
+<g>`;
+
+    // Add each path
     let pathCount = 0;
     for (const path of layer.paths) {
-      // Skip paths with less than 3 points (they can't form proper polygons)
       if (path.length < 3) continue;
-      
-      // No need to check if closed - we already ensured this in buildPaths
-      const pathData = path.map((point, index) => 
+
+      const pathData = path.map((point, index) =>
         `${index === 0 ? 'M' : 'L'}${point.x.toFixed(3)},${point.y.toFixed(3)}`
       ).join(' ') + 'Z';
 
@@ -713,12 +730,11 @@ export class StlSlicer {
 
     if (pathCount === 0) {
       svg += `
-  <text x="0" y="0" text-anchor="middle" font-size="3" fill="red">
+  <text x="${((bounds.minX + bounds.maxX) / 2).toFixed(3)}" y="${((bounds.minY + bounds.maxY) / 2).toFixed(3)}" text-anchor="middle" font-size="3" fill="red">
     All paths were invalid for this layer
   </text>`;
     }
 
-    // SVG footer
     svg += `
 </g>
 </svg>`;
