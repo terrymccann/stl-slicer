@@ -45,10 +45,10 @@ export default function StlViewer3D({
   
   const toggleSlicePlanes = useCallback(() => {
     setShowSlicePlanes(prev => !prev);
-    
+
     if (sceneRef.current) {
       sceneRef.current.traverse((object) => {
-        if (object.userData && object.userData.isSliceVisual) {
+        if (object.userData && object.userData.isSlicePlane) {
           object.visible = !showSlicePlanes;
         }
       });
@@ -57,10 +57,10 @@ export default function StlViewer3D({
   
   const toggleAllSlices = useCallback(() => {
     setShowAllSlices(prev => !prev);
-    
+
     if (sceneRef.current) {
       sceneRef.current.traverse((object) => {
-        if (object.userData && object.userData.isSliceVisual) {
+        if (object.userData && object.userData.isSlicePlane) {
           const sliceIndex = object.userData.sliceIndex;
           if (sliceIndex !== undefined) {
             object.visible = showAllSlices || sliceIndex === activeLayerIndex;
@@ -70,13 +70,32 @@ export default function StlViewer3D({
     }
   }, [showAllSlices, activeLayerIndex]);
   
+  // Helper: remove and dispose all slice planes from the scene
+  const removeAllSlicePlanes = useCallback((scene: THREE.Scene) => {
+    const planes = scene.children.filter((child: THREE.Object3D) =>
+      child.userData && child.userData.isSlicePlane);
+
+    planes.forEach((plane: THREE.Object3D) => {
+      scene.remove(plane);
+      if ((plane as THREE.Mesh).geometry) {
+        (plane as THREE.Mesh).geometry.dispose();
+      }
+      const mat = (plane as THREE.Mesh).material;
+      if (mat) {
+        if (Array.isArray(mat)) {
+          mat.forEach(m => m.dispose());
+        } else if (mat instanceof THREE.Material) {
+          mat.dispose();
+        }
+      }
+    });
+  }, []);
+
   // Initialize the Three.js scene, camera, and renderer
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current || initRef.current) return;
     
     try {
-      console.log("[StlViewer3D] Starting initialization");
-      
       // Setting up scene
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0xf0f0f0);
@@ -127,13 +146,7 @@ export default function StlViewer3D({
       controls.target.set(0, 0, 0);
       controls.update();
       controlsRef.current = controls;
-      console.log("[StlViewer3D] Set up controls", controls);
-      
-      // Test event handling
-      renderer.domElement.addEventListener('pointerdown', () => {
-        console.log("[StlViewer3D] Pointer down event");
-      });
-      
+
       // Add helpers
       const gridHelper = new THREE.GridHelper(100, 20);
       gridHelper.position.y = -20;
@@ -203,7 +216,6 @@ export default function StlViewer3D({
       
       // Cleanup function
       return () => {
-        console.log("[StlViewer3D] Cleaning up resources");
         cancelAnimationFrame(animFrameId);
         window.removeEventListener('resize', handleResize);
         
@@ -239,8 +251,7 @@ export default function StlViewer3D({
           }
         }
       };
-    } catch (error) {
-      console.error("[StlViewer3D] Error setting up scene:", error);
+    } catch {
       setErrorMessage("Failed to initialize 3D viewer. Please try reloading the page.");
     }
   }, []);
@@ -256,19 +267,25 @@ export default function StlViewer3D({
     if (!scene || !camera || !controls) return;
     
     const loadSTL = async () => {
-      console.log("[StlViewer3D] Loading STL:", stlFile.name);
-      
-      // Remove previous model
+      // Remove all previous slice planes
+      removeAllSlicePlanes(scene);
+
+      // Remove previous model meshes
       const existingModels = scene.children.filter(
-        child => child instanceof THREE.Mesh && 
+        child => child instanceof THREE.Mesh &&
         !(child.userData && (child.userData.isSlicePlane || child.userData.isHelper))
       );
-      
+
       existingModels.forEach(model => {
         scene.remove(model);
         if ((model as THREE.Mesh).geometry) (model as THREE.Mesh).geometry.dispose();
-        if ((model as THREE.Mesh).material instanceof THREE.Material) {
-          ((model as THREE.Mesh).material as THREE.Material).dispose();
+        const mat = (model as THREE.Mesh).material;
+        if (mat) {
+          if (Array.isArray(mat)) {
+            mat.forEach(m => m.dispose());
+          } else if (mat instanceof THREE.Material) {
+            mat.dispose();
+          }
         }
       });
       
@@ -302,8 +319,7 @@ export default function StlViewer3D({
         
         // Add to scene
         scene.add(model);
-        console.log("[StlViewer3D] Model added to scene");
-        
+
         // Adjust camera position based on model size
         const size = new THREE.Vector3();
         boundingBox.getSize(size);
@@ -319,8 +335,7 @@ export default function StlViewer3D({
         
         // Call once after loading
         renderSlicePlanes();
-      } catch (error) {
-        console.error("[StlViewer3D] Error loading STL:", error);
+      } catch {
         setErrorMessage("Failed to load STL file");
       }
     };
@@ -332,17 +347,9 @@ export default function StlViewer3D({
   const renderSlicePlanes = useCallback(() => {
     const scene = sceneRef.current;
     if (!scene || !layers.length) return;
-    
-    // Remove existing slice planes from the scene
-    const existingPlanes = scene.children.filter((child: THREE.Object3D) => 
-      child.userData && child.userData.isSlicePlane);
-    
-    existingPlanes.forEach((plane: THREE.Object3D) => {
-      scene.remove(plane);
-      if ((plane as THREE.Mesh).geometry) (plane as THREE.Mesh).geometry.dispose();
-      if ((plane as THREE.Mesh).material instanceof THREE.Material) 
-        ((plane as THREE.Mesh).material as THREE.Material).dispose();
-    });
+
+    // Remove and dispose all existing slice planes
+    removeAllSlicePlanes(scene);
     
     // Don't create new planes if we're not showing them
     if (!showSlicePlanes) return;
@@ -367,7 +374,6 @@ export default function StlViewer3D({
     // Get the model min and max for correct slice positioning
     const modelMin = modelBounds.min;
     const modelMax = modelBounds.max;
-    console.log("[StlViewer3D] Model bounds:", { min: modelMin, max: modelMax });
     
     // Make the planes slightly larger than the model
     const planeWidth = Math.max(modelSize.x, modelSize.z) * 1.2;
@@ -400,9 +406,6 @@ export default function StlViewer3D({
       axisEnd = modelMax.z;
     }
     
-    console.log("[StlViewer3D] Axis range:", { start: axisStart, end: axisEnd });
-    console.log("[StlViewer3D] Layers count:", layers.length);
-    
     // Determine which layers to render based on user preference
     let startIdx, endIdx;
     
@@ -429,8 +432,6 @@ export default function StlViewer3D({
       // Calculate the actual position in scene coordinates
       const layerPosition = axisStart + normalizedPos * (axisEnd - axisStart);
       
-      console.log(`[StlViewer3D] Layer ${i}: nominal z=${layer.z}, actual pos=${layerPosition}`);
-      
       const material = new THREE.MeshBasicMaterial({
         color: isActive ? 0xff5500 : 0x00ff00,
         opacity: isActive ? 0.7 : 0.3,
@@ -440,10 +441,9 @@ export default function StlViewer3D({
       });
       
       const plane = new THREE.Mesh(planeGeometry.clone(), material);
-      // Mark this as a slice plane for easy identification
-      plane.userData = { isSlicePlane: true };
-      
-      // Position plane based on axis and the calculated position
+      plane.userData = { isSlicePlane: true, sliceIndex: i };
+
+      // Position plane based on axis
       if (axis === 'x') {
         plane.position.x = layerPosition;
       } else if (axis === 'y') {
@@ -451,15 +451,18 @@ export default function StlViewer3D({
       } else {
         plane.position.z = layerPosition;
       }
-      
+
       scene.add(plane);
     }
-    
+
+    // Dispose the base geometry template — clones are independent
+    planeGeometry.dispose();
+
     // Trigger a render
     if (rendererRef.current && cameraRef.current) {
       rendererRef.current.render(scene, cameraRef.current);
     }
-  }, [layers, activeLayerIndex, axis, showSlicePlanes, showAllSlices]);
+  }, [layers, activeLayerIndex, axis, showSlicePlanes, showAllSlices, removeAllSlicePlanes]);
   
   // Effect to update slice planes when layers, active layer, or axis changes
   useEffect(() => {
